@@ -1,43 +1,91 @@
+/**
+ * SVP Engine
+ * 核心引擎，整合配置、编译、文件监听
+ */
+
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import * as YAML from 'yaml';
-import { L5Blueprint, L4LogicChain, L3LogicBlock, CompileOutput, CompileMetadata } from '@semanticvoxelprotocol/ir';
+import { L5Blueprint, validateL5 } from '@semanticvoxelprotocol/ir';
+import { SVPCompiler, CompileOptions, CompileResult } from './compiler';
+import { loadProjectConfig, SVPProjectConfig } from './config';
 
-export interface SVPConfig {
+export interface SVPEngineOptions {
   projectPath: string;
-  targetLanguage: 'typescript' | 'python' | 'go' | 'rust';
+  targetLanguage?: 'typescript' | 'python' | 'go' | 'rust';
   incremental?: boolean;
   strict?: boolean;
 }
 
-export interface CompileOptions {
-  level: 5 | 4 | 3 | 2;
-  target?: string;
-  dryRun?: boolean;
-}
-
-export interface CompileResult {
-  success: boolean;
-  output?: CompileOutput<unknown>;
-  errors: CompileError[];
-}
-
-export interface CompileError {
-  level: number;
-  message: string;
-  file?: string;
-  line?: number;
+export interface EngineStatus {
+  initialized: boolean;
+  levels: {
+    5: { exists: boolean; file?: string };
+    4: { exists: boolean; file?: string };
+    3: { exists: boolean; files?: string[] };
+    2: { exists: boolean; files?: string[] };
+    1: { exists: boolean; files?: string[] };
+  };
+  config?: SVPProjectConfig;
 }
 
 export class SVPEngine {
-  private config: SVPConfig;
+  private options: SVPEngineOptions;
+  private compiler: SVPCompiler;
   private cache: Map<string, string> = new Map();
 
-  constructor(config: SVPConfig) {
-    this.config = {
+  constructor(options: SVPEngineOptions) {
+    this.options = {
+      targetLanguage: 'typescript',
       incremental: true,
       strict: false,
-      ...config
+      ...options,
+    };
+    this.compiler = new SVPCompiler(options.projectPath);
+  }
+
+  /**
+   * 获取引擎状态
+   */
+  async getStatus(): Promise<EngineStatus> {
+    const { projectPath } = this.options;
+
+    // 检查 L5
+    const l5Path = path.join(projectPath, 'blueprint.svp.yaml');
+    const l5Exists = await this.fileExists(l5Path);
+
+    // 检查 L4
+    const l4Path = path.join(projectPath, '.svp', 'l4', 'flows.yaml');
+    const l4Exists = await this.fileExists(l4Path);
+
+    // 检查 L3
+    const l3Dir = path.join(projectPath, '.svp', 'l3');
+    const l3Exists = await this.dirExists(l3Dir);
+    const l3Files = l3Exists ? await this.listYamlFiles(l3Dir) : [];
+
+    // 检查 L2
+    const l2Dir = path.join(projectPath, '.svp', 'gen', 'blocks');
+    const l2Exists = await this.dirExists(l2Dir);
+    const l2Files = l2Exists ? await this.listBlockFiles(l2Dir) : [];
+
+    // 检查 L1
+    const l1Dir = path.join(projectPath, 'src', 'blocks');
+    const l1Exists = await this.dirExists(l1Dir);
+    const l1Files = l1Exists ? await this.listTsFiles(l1Dir) : [];
+
+    // 加载配置
+    const config = await loadProjectConfig(projectPath);
+
+    return {
+      initialized: l5Exists,
+      levels: {
+        5: { exists: l5Exists, file: l5Exists ? 'blueprint.svp.yaml' : undefined },
+        4: { exists: l4Exists, file: l4Exists ? '.svp/l4/flows.yaml' : undefined },
+        3: { exists: l3Exists, files: l3Files },
+        2: { exists: l2Exists, files: l2Files },
+        1: { exists: l1Exists, files: l1Files },
+      },
+      config: config || undefined,
     };
   }
 
@@ -45,129 +93,154 @@ export class SVPEngine {
    * 编译指定层级
    */
   async compile(options: CompileOptions): Promise<CompileResult> {
-    const { level, target, dryRun } = options;
-
-    try {
-      switch (level) {
-        case 5:
-          return await this.compileL5ToL4(target, dryRun);
-        case 4:
-          return await this.compileL4ToL3(target, dryRun);
-        case 3:
-          return await this.compileL3ToL2(target, dryRun);
-        case 2:
-          return await this.compileL2ToL1(target, dryRun);
-        default:
-          return { success: false, errors: [{ level, message: `Unsupported level: ${level}` }] };
-      }
-    } catch (error) {
-      return {
-        success: false,
-        errors: [{
-          level,
-          message: error instanceof Error ? error.message : String(error)
-        }]
-      };
-    }
+    return this.compiler.compile(options);
   }
 
   /**
    * 加载 L5 蓝图
    */
-  async loadL5(): Promise<L5Blueprint> {
-    const blueprintPath = path.join(this.config.projectPath, 'blueprint.svp.yaml');
-    const content = await fs.readFile(blueprintPath, 'utf-8');
-    return YAML.parse(content) as L5Blueprint;
-  }
-
-  /**
-   * 保存编译输出
-   */
-  async saveOutput(filePath: string, content: string): Promise<void> {
-    if (!this.config.incremental || await this.hasChanged(filePath, content)) {
-      await fs.mkdir(path.dirname(filePath), { recursive: true });
-      await fs.writeFile(filePath, content, 'utf-8');
-      this.cache.set(filePath, await this.hash(content));
-    }
-  }
-
-  /**
-   * 检查文件是否变更
-   */
-  private async hasChanged(filePath: string, content: string): Promise<boolean> {
-    try {
-      const existing = await fs.readFile(filePath, 'utf-8');
-      return existing !== content;
-    } catch {
-      return true;
-    }
-  }
-
-  /**
-   * 计算内容哈希
-   */
-  private async hash(content: string): Promise<string> {
-    // 简化版，实际使用 xxhash
-    return Buffer.from(content).toString('base64').slice(0, 16);
-  }
-
-  /**
-   * L5 → L4 编译
-   * 调用外部 AI 编译器
-   */
-  private async compileL5ToL4(target?: string, dryRun?: boolean): Promise<CompileResult> {
-    const l5 = await this.loadL5();
+  async loadL5(): Promise<L5Blueprint | null> {
+    const l5Path = path.join(this.options.projectPath, 'blueprint.svp.yaml');
     
-    // 这里会调用 AI 编译器 (svp-compiler-l5-to-l4)
-    // 简化版：直接返回需要外部编译器处理
-    return {
-      success: false,
-      errors: [{
-        level: 5,
-        message: 'L5→L4 compilation requires AI compiler. Use `svp compile --level 5` with --ai flag or MCP.'
-      }]
-    };
+    try {
+      const content = await fs.readFile(l5Path, 'utf-8');
+      const parsed = YAML.parse(content);
+      
+      const validation = validateL5(parsed);
+      if (validation.valid) {
+        return validation.data;
+      }
+      
+      return null;
+    } catch {
+      return null;
+    }
   }
 
   /**
-   * L4 → L3 编译
+   * 初始化新项目
    */
-  private async compileL4ToL3(target?: string, dryRun?: boolean): Promise<CompileResult> {
-    // 类似 L5→L4，调用 AI 编译器
-    return {
-      success: false,
-      errors: [{
-        level: 4,
-        message: 'L4→L3 compilation requires AI compiler. Use `svp compile --level 4` with --ai flag or MCP.'
-      }]
+  async init(projectName: string, language: string): Promise<void> {
+    const { projectPath } = this.options;
+
+    // 创建 .svp 目录结构
+    await fs.mkdir(path.join(projectPath, '.svp', 'l4'), { recursive: true });
+    await fs.mkdir(path.join(projectPath, '.svp', 'l3'), { recursive: true });
+    await fs.mkdir(path.join(projectPath, '.svp', 'gen', 'blocks'), { recursive: true });
+    await fs.mkdir(path.join(projectPath, 'src', 'blocks'), { recursive: true });
+
+    // 创建 L5 蓝图模板
+    const blueprint: L5Blueprint = {
+      svpVersion: '0.1.0',
+      level: 5,
+      project: {
+        name: projectName,
+        description: `A ${language} project using SVP`,
+        version: '0.1.0',
+      },
+      intent: {
+        problem: 'Describe the problem you want to solve',
+        solution: 'Describe your solution approach',
+        successCriteria: ['Define what success looks like'],
+      },
+      constraints: {
+        functional: ['List functional constraints'],
+        nonFunctional: ['List performance/security constraints'],
+      },
+      domains: [
+        {
+          name: 'Core',
+          responsibility: 'Core business logic',
+          boundaries: {
+            inScope: ['Core functionality'],
+            outOfScope: ['External integrations'],
+          },
+          dependencies: [],
+        },
+      ],
+      integrations: [],
+      context: {
+        designDocs: [],
+        environment: [],
+      },
     };
+
+    await fs.writeFile(
+      path.join(projectPath, 'blueprint.svp.yaml'),
+      YAML.stringify(blueprint),
+      'utf-8'
+    );
+
+    // 创建 .gitignore
+    const gitignoreContent = `# SVP Generated Files
+.svp/gen/
+src/blocks/*.svp.ts
+.svp/cache/
+`;
+    await fs.writeFile(
+      path.join(projectPath, '.svp', '.gitignore'),
+      gitignoreContent,
+      'utf-8'
+    );
   }
 
   /**
-   * L3 → L2 编译
+   * 工具方法：检查文件是否存在
    */
-  private async compileL3ToL2(target?: string, dryRun?: boolean): Promise<CompileResult> {
-    // 类似
-    return {
-      success: false,
-      errors: [{
-        level: 3,
-        message: 'L3→L2 compilation requires AI compiler. Use `svp compile --level 3` with --ai flag or MCP.'
-      }]
-    };
+  private async fileExists(filePath: string): Promise<boolean> {
+    try {
+      await fs.access(filePath);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**
-   * L2 → L1 编译
+   * 工具方法：检查目录是否存在
    */
-  private async compileL2ToL1(target?: string, dryRun?: boolean): Promise<CompileResult> {
-    // 类似
-    return {
-      success: false,
-      errors: [{
-        level: 2,
-        message: 'L2→L1 compilation requires AI compiler. Use `svp compile --level 2` with --ai flag or MCP.'
-      }]
-    };
+  private async dirExists(dirPath: string): Promise<boolean> {
+    try {
+      const stat = await fs.stat(dirPath);
+      return stat.isDirectory();
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * 列出 YAML 文件
+   */
+  private async listYamlFiles(dir: string): Promise<string[]> {
+    try {
+      const files = await fs.readdir(dir);
+      return files.filter(f => f.endsWith('.yaml') || f.endsWith('.yml'));
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * 列出 Block 文件
+   */
+  private async listBlockFiles(dir: string): Promise<string[]> {
+    try {
+      const files = await fs.readdir(dir);
+      return files.filter(f => f.endsWith('.block'));
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * 列出 TypeScript 文件
+   */
+  private async listTsFiles(dir: string): Promise<string[]> {
+    try {
+      const files = await fs.readdir(dir);
+      return files.filter(f => f.endsWith('.ts') && !f.endsWith('.d.ts'));
+    } catch {
+      return [];
+    }
   }
 }

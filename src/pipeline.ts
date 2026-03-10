@@ -1,4 +1,5 @@
-import { SVPEngine, CompileResult, CompileError } from './engine';
+import { SVPEngine } from './engine';
+import type { CompileResult, CompileError } from './compiler';
 
 export interface PipelineOptions {
   from: 5 | 4 | 3 | 2 | 1;
@@ -64,7 +65,7 @@ export class CompilePipeline {
     const affectedLevels = this.determineAffectedLevels(changedBlocks);
 
     for (const level of affectedLevels) {
-      const result = await this.engine.compile({ level });
+      const result = await this.engine.compile({ level: level as 5 | 4 | 3 | 2 });
       results.set(level, result);
 
       if (!result.success) {

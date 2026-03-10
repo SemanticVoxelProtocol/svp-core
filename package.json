@@ -10,7 +10,7 @@
     "lint": "eslint src/**/*.ts"
   },
   "dependencies": {
-    "@semanticvoxelprotocol/ir": "workspace:*",
+    "@semanticvoxelprotocol/ir": "^0.1.0",
     "yaml": "^2.4.0",
     "chokidar": "^3.6.0",
     "xxhashjs": "^0.2.2"
